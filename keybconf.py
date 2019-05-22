@@ -1,0 +1,11 @@
+BACKSPACE = 263 # macOS 127
+LEFT = 260
+RIGHT = 261
+UP = 259
+DOWN = 258
+ENTER = 10
+
+# unused
+CTRL_I = 9
+CTRL_O = 15
+CTRL_P = 16

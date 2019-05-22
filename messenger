@@ -1,0 +1,415 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+# @author: Samy Bencherif
+# @copyright: May 2019
+# @file: messenger
+# @description: This program verbally abuses git into being a CLI chat
+# room backend.
+
+# If this program breaks, contact samy@programmer.net for the latest
+# version!
+
+import config
+import keybconf
+
+import curses
+from curses import wrapper
+
+import subprocess
+import sys
+import os
+
+import signal
+import sys
+
+import time
+
+curl = lambda url: \
+    subprocess.check_output('curl -s "%s"' % url, shell=True) + "\n"
+
+fget = lambda path: open(path, "rt").read()
+
+syncMsgs = lambda: subprocess.check_output(
+        "sh syncMessages.sh 2>/dev/null", shell=True)
+
+asciiSet = range(0x20, 0x7F)
+# To keep things simple I will hand pick a few emoji to support
+emojiSet = [0x263A]
+# Maybe add some accents
+printableSet = asciiSet or emojiSet
+
+NOP = lambda *k: None
+
+class Person:
+
+    def __init__(self, nick, path, local=False):
+        self.nick = nick
+        self.path = path
+
+        if local:
+            self.pullMsg = self._getLocalMsg
+        else:
+            self.pullMsg = self._getOnlineMsg
+
+        self.reset(withPull=True)
+
+    def _getLocalMsg(self):
+        self.messages = fget(self.path)
+
+    def _getOnlineMsg(self):
+        self.messages = curl(self.path)
+
+    def getRowCount(self, maxWidth):
+        return 1 + (len(self.messages.split("\n")[self.index])\
+                // maxWidth)
+
+    def formatMsg(self, maxWidth, row=0):
+        return (self.nick + ": " if row==0 else "   ") + \
+                self.messages.split("\n")[self.index].split(": ")[-1]\
+                [maxWidth*row:maxWidth*(row+1)]
+  
+    def reset(self, withPull=False):
+        if withPull:
+            self.pullMsg()
+
+        self.index = len(self.messages.split("\n"))-1
+
+        if self.index < 0:
+            return
+
+        if self.hasNoMsgs():
+            self.advanceMessage(tolerateEmptyLines=True)
+
+
+    def hasNoMsgs(self):
+        return not self.messages.split("\n")[self.index].strip()
+
+    def advanceMessage(self, tolerateEmptyLines=False):
+        
+        # by invariant file is "empty"
+        if self.hasNoMsgs() and not tolerateEmptyLines:
+            return
+
+        self.index -= 1
+       
+        # in this case, person only appears to have no messages
+        # due to a potentially misplaced index pointer (the loop
+        # corrects this)
+        while self.hasNoMsgs():
+            self.index -= 1
+
+    def finished(self):
+        return self.messages == None or self.index < 0
+
+    def getTime(self):
+        
+        if self.hasNoMsgs():
+            # never select a mute node as speaker
+            return float("-inf") 
+        
+        if self.finished():
+            # never select finished node as next speaker
+            return float("-inf") 
+        
+        return float(
+                self.messages.split("\n")[self.index].\
+                                                split(": ")[0][1:-1]
+                )
+
+
+class Prompt:
+
+
+    def __init__(self, title="title", msg="this or that",
+            choices=["this", "that"], outcomes=None):
+
+        self.title = title
+        self.msg = msg
+        self.choices = choices
+        self.outcomes = outcomes
+
+        self.choiceIndex = 0
+
+    def trigger(self):
+        if self.outcomes:
+            self.outcomes[self.choiceIndex]()
+
+    def up(self):
+        if self.choiceIndex > 0:
+            self.choiceIndex -= 1
+
+    def down(self):
+        if self.choiceIndex < len(self.choices) - 1:
+            self.choiceIndex += 1
+
+    def blit(self, scr, h, w, menuColor):
+        render = str(self)
+        pw = max([len(x) for x in render.split("\n")])
+        ph = len(render.split("\n"))
+        for i, l in enumerate(render.split("\n")):
+            scr.addstr(i + h//2 - ph//2,
+                    w//2 - pw//2,
+                    l.ljust(pw), menuColor)
+
+    def __repr__(self):
+        title = self.title
+        msg = self.msg
+        choices = self.choices
+        choiceIndex = self.choiceIndex
+
+
+        # inner spacing:  (3 underscores)
+        ___i = max( 1+len(title)+2,
+                        max([2+len(x)+3 for x in msg.split("\n")]),
+                        max([2+len(x)+2+3 for x in choices])
+                        )
+
+        # outer spacing:
+        ___o = ___i+2
+
+        # casing
+        c = "*"
+
+        # spacing
+        s = " "
+
+        # new line
+        nl = "\n"
+
+        # pointer
+        p = "<"
+
+        out = c*___o + nl + c + s + title + \
+                (___i - len(title) - 1) * s + \
+              c + nl + c*___o + nl + c + ___i*s + c + nl
+
+        for msgline in msg.split("\n"):
+            out += c + 2*s + msgline + \
+                    (___i - len(msgline) - 2) * s + \
+                    c + nl
+
+        out += c + ___i * s + c + nl
+
+
+        for i, choice in enumerate(choices):
+            out += c + 2*s + choice + s + \
+                    (p if i==choiceIndex else s) + \
+                    (___i - len(choice) - 4) * s + \
+                    c + nl
+
+        out += c*___o
+
+        return out
+
+
+def main(scr):
+
+    # Let -1 represent users default colors
+    curses.use_default_colors()
+
+    curses.init_pair(1, -1, -1)
+    normalColor = curses.color_pair(1)
+
+    curses.init_pair(2, curses.COLOR_WHITE, curses.COLOR_BLUE)
+    menuColor = curses.color_pair(2)
+
+    curses.init_pair(3, curses.COLOR_BLACK, curses.COLOR_YELLOW)
+    alertColor = curses.color_pair(3)
+
+    state = {
+                "activePrompt": None,
+                "msgBuff": "",
+                "msgBuffIndex": 0
+            }
+
+
+    def cancelMsg():
+        state["msgBuff"] = ""
+        state["msgBuffIndex"] = 0
+
+    def signal_handler(sig, frame):
+        state["activePrompt"] = Prompt("Clear or Quit",
+        "Clear your message\nor quit the program?",
+        ["Clear", "Quit", "Do Nothing"],
+        [cancelMsg, sys.exit, NOP])
+
+    signal.signal(signal.SIGINT, signal_handler)
+
+    scr.bkgd(' ', normalColor)
+
+    k = ""
+
+    #scr.nodelay(True)
+
+    # how long to wait at getch in tenths
+    curses.halfdelay(config.refreshRate)
+
+    # fix mouse bug
+    curses.mousemask(-1)
+
+    People = []
+
+    # Adds self to list of people
+    People.append(Person(config.myNick, config.myMessagesLog, 
+        local=True))
+
+    # Adds each friend to list of people
+    for (fnick, furl) in config.friends.items():
+        People.append(Person(fnick, furl, local=True))
+
+    while True:
+
+        h,w = scr.getmaxyx()
+
+        for person in People:
+            person.reset()
+
+        printingLine = h-4
+        nextSpkr = max(People, key=lambda p: p.getTime())
+
+        while not nextSpkr.finished() and printingLine >= 0 and \
+                not nextSpkr.hasNoMsgs():
+
+            # print msg on printingLine
+
+            for r in range(nextSpkr.getRowCount(w-3)-1, -1, -1):
+                scr.addstr(
+                        printingLine,
+                        0,
+                        nextSpkr.formatMsg(w-3, row=r),
+                        normalColor
+                )
+                printingLine -= 1
+                if printingLine < 0:
+                    break
+            
+            printingLine -= 1
+
+            nextSpkr.advanceMessage()
+            nextSpkr = max(People, key=lambda p: p.getTime())
+
+
+
+        # show my messages
+        #scr.addstr(0, 0, People[0].formatMsg(w-3), normalColor)
+
+        ## show their messages
+        #scr.addstr(2, 0, People[1].formatMsg(w-3), normalColor)
+
+        #scr.addstr(4, 0, People[0].formatMsg(w-3, index=1), normalColor)
+        #
+        #scr.addstr(6, 0, People[1].formatMsg(w-3, index=1), normalColor)
+        #scr.addstr(7, 0, People[1].formatMsg(w-3, index=1, row=1), normalColor)
+
+        # disp pressed char (debug)
+        #scr.addstr(h-3, 20, str(k), menuColor)
+        
+        
+        # show msg input box at bottom
+        LCount = 1 + len(state["msgBuff"]) // (w-3)
+        scr.addstr(h-1-LCount, 0, "_"*w,
+                normalColor)
+        for i in range(LCount):
+            scr.addstr(h-LCount+i, 0, "> " + \
+                    state["msgBuff"][i*(w-3):(i+1) *
+                (w-3)], normalColor)
+
+        scr.addstr(
+                h-LCount + state["msgBuffIndex"] // (w-3),
+                2 + (state["msgBuffIndex"] % (w-3)) , "",
+                normalColor)
+
+
+        if state["activePrompt"]:
+
+            # autocentered
+            state["activePrompt"].blit(scr, h, w, menuColor)
+
+            curses.curs_set(0)
+        else:
+            curses.curs_set(1)
+
+        # print buffer to console
+        scr.refresh()
+
+        # take keyboard input
+        try:
+            k = scr.getch()
+
+            if k in printableSet:
+                state["msgBuff"] = state["msgBuff"]\
+                        [:state["msgBuffIndex"]] + chr(k) + \
+                        state["msgBuff"][state["msgBuffIndex"]:]
+                state["msgBuffIndex"] += 1
+            elif k == keybconf.BACKSPACE:
+                state["msgBuff"] = state["msgBuff"]\
+                        [:state["msgBuffIndex"]-1] + \
+                        state["msgBuff"][state["msgBuffIndex"]:]
+                if state["msgBuffIndex"] > 0:
+                    state["msgBuffIndex"] -= 1
+            elif k == keybconf.LEFT:
+                if state["msgBuffIndex"] > 0:
+                    state["msgBuffIndex"] -= 1
+            elif k == keybconf.RIGHT:
+                if state["msgBuffIndex"] < len(state["msgBuff"]):
+                    state["msgBuffIndex"] += 1
+            elif state["activePrompt"]:
+                if k == keybconf.UP:
+                    state["activePrompt"].up()
+                elif k == keybconf.DOWN:
+                    state["activePrompt"].down()
+                if k == keybconf.ENTER:
+                    state["activePrompt"].trigger()
+                    state["activePrompt"] = None
+            elif k == keybconf.ENTER:
+                # send a message !
+
+                fp = open(config.myMessagesLog, "at")
+                fp.write("[" + str(time.time()) + "]: " + \
+                        state["msgBuff"] + "\n")
+                fp.close()
+
+                state["msgBuff"] = ""
+                state["msgBuffIndex"] = 0
+
+                for person in People:
+                    person.reset(withPull=True)
+
+            elif k == -1:
+
+                # sync up message updates with automatic screen updates
+                
+                # indicate the network is refreshing 
+                scr.addstr(
+                    h-3,
+                    w//2 - 6, " REFRESHING ",
+                    alertColor
+                )
+               
+                # preserve cursor location when showing alert
+                scr.addstr(
+                    h-LCount + state["msgBuffIndex"] // (w-3),
+                    2 + (state["msgBuffIndex"] % (w-3)) , "",
+                    normalColor)
+
+                # refresh the display (to show the alert)
+                scr.refresh()
+
+                try:
+                    syncMsgs()
+                except:
+                    pass
+
+                for person in People:
+                    person.reset(withPull=True)
+
+        except Exception as ex:
+            raise ex
+            # no input
+            pass
+
+        # clear the screen
+        scr.clear()
+
+wrapper(main)
